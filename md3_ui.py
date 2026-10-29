@@ -13,8 +13,10 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
 
+from scan_paths import MODES, path_key
 
-VERSION = '1.4'
+
+VERSION = '1.7'
 C = dict(surface='#F8FAFD', low='#F0F4F9', container='#E9EEF6', high='#E1E7EF',
          card='#FFFFFF', text='#1F1F1F', muted='#444746', outline='#747775',
          divider='#C4C7C5', primary='#0B57D0', on_primary='#FFFFFF',
@@ -29,7 +31,7 @@ GLYPHS = dict(check='\ue5ca', scan='\ue8b6', results='\ue85d', help='\ue887',
               folder='\ue2c7', add='\ue145', close='\ue5cd', play='\ue037',
               stop='\ue047', report='\ue873', shield='\ue9e0', disk='\ue1db',
               arrow='\ue5c8', copy='\ue14d', launch='\ue89e', info='\ue88e',
-              warning='\ue002', document='\ue24d')
+              warning='\ue002', document='\ue24d', repair='\ue869')
 
 
 @lru_cache(maxsize=96)
@@ -126,8 +128,11 @@ class Button(ctk.CTkButton):
 class ElidedLabel(ctk.CTkLabel):
     """窄窗口内保留路径首尾；完整路径在结果详情中可复制。"""
     def __init__(self, parent, **kwargs):
+        kwargs.setdefault('width', 1)
+        kwargs.setdefault('height', 28)
         super().__init__(parent, text='', anchor='w', font=(FONT, 12),
                          text_color=C['muted'], **kwargs)
+        self.grid_propagate(False)
         self.full_text = ''
         tk.Frame.bind(self, '<Configure>', lambda _: self.refresh(), add='+')
 
@@ -162,8 +167,27 @@ class AuditApp:
         self.window, self.engine, self.base_dir = window, engine, Path(base_dir)
         self.messages = queue.Queue()
         self.cancelled = threading.Event()
-        self.state = dict(running=False, report=None, close_requested=False)
+        self.state = dict(running=False, repairing=False, report=None, close_requested=False)
+        self.repair_cancelled = threading.Event()
+        self.repair_info, self.repair_directory = {}, None
+        self.repair_mode = tk.StringVar(value='另存修复版')
+        self.active_repair_in_place = False
         self.options, self.drive_buttons, self.folders, self.scope_controls = [], [], [], []
+        self.scan_mode, self.exclude_dirs = 'recommended', []
+        self.scan_settings_path = self.base_dir / '扫描设置.json'
+        self.scan_settings_error = ''
+        try:
+            settings = json.loads(self.scan_settings_path.read_text(encoding='utf-8'))
+            if (not isinstance(settings, dict) or settings.get('mode') not in MODES
+                    or not isinstance(settings.get('exclude_dirs'), list)
+                    or any(not isinstance(path, str) or not path.strip() for path in settings['exclude_dirs'])):
+                raise ValueError('扫描设置内容不完整')
+            self.scan_mode = settings['mode']
+            self.exclude_dirs = list(dict.fromkeys(path_key(path) for path in settings['exclude_dirs']))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            self.scan_settings_error = f'上次设置未读取，当前使用默认设置：{exc}'
         self.results, self.summary = [], None
         self.active_page = 'scan'
         self.filter_mode = '全部'
@@ -191,7 +215,7 @@ class AuditApp:
         self.subtitle.grid(row=1, column=0, sticky='w', pady=(6, 0))
         badge = ctk.CTkFrame(header, fg_color=C['success_container'], corner_radius=16)
         badge.grid(row=0, column=1, rowspan=2, sticky='e', padx=(12, 0))
-        label(badge, '本地 · 只读', 12, C['success'], image=icon('shield', C['success'], 16),
+        label(badge, '本地处理', 12, C['success'], image=icon('shield', C['success'], 16),
               compound='left', height=24).pack(padx=12, pady=4)
         self.pages = {}
         for key in ('scan', 'results', 'help'):
@@ -250,15 +274,28 @@ class AuditApp:
         label(heading, '检查范围', 20, bold=True).pack(side='left')
         self.scope_count = label(heading, '', 12, C['muted'])
         self.scope_count.pack(side='right')
+        mode_row = ctk.CTkFrame(self.scope_card, fg_color='transparent')
+        mode_row.grid(row=1, column=0, sticky='ew', padx=24)
+        mode_row.grid_columnconfigure((0, 1), weight=1)
+        self.scan_mode_buttons = {}
+        for column, (mode, caption) in enumerate(MODES.items()):
+            button = Button(mode_row, caption, lambda m=mode: self.set_scan_mode(m),
+                            'outlined', width=120, height=40)
+            button.grid(row=0, column=column, sticky='ew', padx=(0, 8) if column == 0 else (0, 0))
+            self.scan_mode_buttons[mode] = button
+            self.scope_controls.append(button)
+        self.scan_mode_note = label(self.scope_card, '', 12, C['muted'], justify='left', wraplength=280)
+        self.scan_mode_note.grid(row=2, column=0, sticky='ew', padx=24, pady=(8, 16))
+        self.update_scan_mode()
         row = ctk.CTkFrame(self.scope_card, fg_color='transparent')
-        row.grid(row=1, column=0, sticky='ew', padx=24)
+        row.grid(row=3, column=0, sticky='ew', padx=24)
         label(row, '本地磁盘', 14, bold=True).pack(side='left')
         for text, value in [('清空', False), ('全选', True)]:
             button = Button(row, text, lambda v=value: self.select_all(v), 'text', width=52, height=36)
             button.pack(side='right')
             self.scope_controls.append(button)
         self.drive_frame = ctk.CTkFrame(self.scope_card, fg_color='transparent')
-        self.drive_frame.grid(row=2, column=0, sticky='ew', padx=24, pady=(8, 20))
+        self.drive_frame.grid(row=4, column=0, sticky='ew', padx=24, pady=(8, 20))
         for drive in self.engine.fixed_drives():
             value = tk.BooleanVar(value=True)
             button = Button(self.drive_frame, drive, lambda v=value: self.toggle_drive(v),
@@ -270,17 +307,34 @@ class AuditApp:
         if not self.options:
             label(self.drive_frame, '未找到本地固定磁盘，请添加文件夹。', 12, C['muted']).pack(anchor='w')
         tk.Frame.bind(self.drive_frame, '<Configure>', self.layout_drives, add='+')
-        ctk.CTkFrame(self.scope_card, height=1, fg_color=C['container']).grid(row=3, column=0, sticky='ew', padx=24)
+        ctk.CTkFrame(self.scope_card, height=1, fg_color=C['container']).grid(row=5, column=0, sticky='ew', padx=24)
         row = ctk.CTkFrame(self.scope_card, fg_color='transparent')
-        row.grid(row=4, column=0, sticky='ew', padx=24, pady=(16, 8))
+        row.grid(row=6, column=0, sticky='ew', padx=24, pady=(16, 8))
         label(row, '指定文件夹', 14, bold=True).pack(side='left')
         add = Button(row, '添加文件夹', self.add_folder, 'text', 'add', width=118, height=40)
         add.pack(side='right')
         self.scope_controls.append(add)
         self.folder_frame = ctk.CTkFrame(self.scope_card, fg_color='transparent')
-        self.folder_frame.grid(row=5, column=0, sticky='ew', padx=24, pady=(0, 24))
+        self.folder_frame.grid(row=7, column=0, sticky='ew', padx=24, pady=(0, 8))
         self.folder_frame.grid_columnconfigure(0, weight=1)
         self.render_folders()
+        self.exclusions_button = Button(self.scope_card, '', self.toggle_exclusions,
+                                        'text', height=40, anchor='w')
+        self.exclusions_button.grid(row=8, column=0, sticky='ew', padx=24, pady=(0, 16))
+        self.scope_controls.append(self.exclusions_button)
+        self.exclusions_open = False
+        self.exclusions_panel = ctk.CTkFrame(self.scope_card, fg_color='transparent')
+        self.exclusions_panel.grid_columnconfigure(0, weight=1)
+        note = label(self.exclusions_panel, '两种模式均生效，设置自动保存。', 12, C['muted'], justify='left')
+        note.grid(row=0, column=0, sticky='w', pady=(0, 8))
+        add_exclusion = Button(self.exclusions_panel, '添加不扫描文件夹', self.add_exclusion,
+                               'outlined', 'add', height=40, width=180)
+        add_exclusion.grid(row=1, column=0, sticky='w', pady=(0, 12))
+        self.scope_controls.append(add_exclusion)
+        self.exclusion_list = ctk.CTkFrame(self.exclusions_panel, fg_color='transparent')
+        self.exclusion_list.grid(row=2, column=0, sticky='ew')
+        self.exclusion_list.grid_columnconfigure(0, weight=1)
+        self.render_exclusions()
         label(self.progress_card, '检查进度', 20, bold=True).grid(row=0, column=0, sticky='w', padx=24, pady=(24, 12))
         self.phase = label(self.progress_card, '准备就绪', 12, C['primary'], corner_radius=12,
                            fg_color=C['primary_container'], padx=12, height=28)
@@ -369,7 +423,75 @@ class AuditApp:
                              text_color=C['on_primary_container'] if active else C['muted'])
             button.normal_border = 0 if active else 1
         self.scope_count.configure(text=f'{count + len(self.folders)} 个位置')
-        self.selection_label.configure(text=f'已选 {count} 个磁盘 · {len(self.folders)} 个文件夹    /    包含所有可访问子文件夹')
+        self.selection_label.configure(text=f'{MODES[self.scan_mode]} · 已选 {count} 个磁盘 · {len(self.folders)} 个文件夹')
+
+    def update_scan_mode(self):
+        for mode, button in self.scan_mode_buttons.items():
+            active = mode == self.scan_mode
+            button.configure(fg_color=C['primary_container'] if active else C['card'],
+                             border_width=0 if active else 1,
+                             text_color=C['on_primary_container'] if active else C['muted'])
+            button.normal_border = 0 if active else 1
+        note = ('跳过已识别的程序、游戏库与缓存。\n手动指定这些目录仍可检查。'
+                if self.scan_mode == 'recommended' else
+                '保留基础排除，检查程序与缓存目录。\n自定义排除仍生效。')
+        self.scan_mode_note.configure(text=self.scan_settings_error or note,
+                                      text_color=C['warning'] if self.scan_settings_error else C['muted'])
+
+    def save_scan_settings(self):
+        try:
+            self.scan_settings_path.write_text(json.dumps(
+                dict(mode=self.scan_mode, exclude_dirs=self.exclude_dirs), ensure_ascii=False, indent=2),
+                encoding='utf-8')
+            self.scan_settings_error = ''
+        except OSError as exc:
+            self.scan_settings_error = f'本次设置已生效，重启后无法保留：{exc}'
+        self.update_scan_mode()
+
+    def set_scan_mode(self, mode):
+        if self.state['running']:
+            return
+        self.scan_mode = mode
+        self.save_scan_settings()
+        self.update_selection()
+
+    def toggle_exclusions(self):
+        self.exclusions_open = not self.exclusions_open
+        if self.exclusions_open:
+            self.exclusions_panel.grid(row=9, column=0, sticky='ew', padx=24, pady=(0, 20))
+        else:
+            self.exclusions_panel.grid_remove()
+        self.render_exclusions()
+
+    def add_exclusion(self):
+        value = filedialog.askdirectory(parent=self.window, title='选择不扫描的文件夹')
+        if value:
+            value = path_key(value)
+            if value not in self.exclude_dirs:
+                self.exclude_dirs.append(value)
+                self.save_scan_settings()
+                self.render_exclusions()
+
+    def remove_exclusion(self, path):
+        self.exclude_dirs.remove(path)
+        self.save_scan_settings()
+        self.render_exclusions()
+
+    def render_exclusions(self):
+        self.exclusions_button.configure(text=f'{"收起" if self.exclusions_open else "展开"}不扫描文件夹 · {len(self.exclude_dirs)}')
+        for child in self.exclusion_list.winfo_children():
+            child.destroy()
+        self.exclusion_remove_buttons = []
+        for i, path in enumerate(self.exclude_dirs):
+            row = ctk.CTkFrame(self.exclusion_list, fg_color=C['low'], corner_radius=12)
+            row.grid(row=i, column=0, sticky='ew', pady=(0, 8))
+            row.grid_columnconfigure(0, weight=1)
+            text = ElidedLabel(row)
+            text.grid(row=0, column=0, sticky='ew', padx=(12, 0))
+            text.set(path)
+            button = Button(row, '移除', lambda p=path: self.remove_exclusion(p), 'text', width=56, height=40)
+            button.grid(row=0, column=1, padx=4)
+            self.exclusion_remove_buttons.append(button)
 
     def add_folder(self):
         value = filedialog.askdirectory(parent=self.window, title='选择检查文件夹')
@@ -412,9 +534,11 @@ class AuditApp:
         page.grid_rowconfigure(2, weight=1)
         top = ctk.CTkFrame(page, fg_color='transparent')
         top.grid(row=0, column=0, sticky='ew', pady=(0, 16))
-        self.result_summary = label(top, '完成一次检查后，在这里查看结果。', 12, C['muted'])
+        self.result_summary = label(top, '完成一次检查后，在这里查看结果。', 12, C['muted'], wraplength=320, justify='left')
         self.result_summary.pack(side='left')
         Button(top, '选择报告', self.choose_report, 'text', 'folder', width=110).pack(side='right')
+        self.repair_folder_button = Button(top, '修复文件夹', self.open_repair_folder, 'text', 'folder', width=120, state='disabled')
+        self.repair_folder_button.pack(side='right', padx=(0, 8))
         self.filters = ctk.CTkFrame(page, fg_color='transparent')
         self.filters.grid(row=1, column=0, sticky='ew', pady=(0, 16))
         self.filters.grid_columnconfigure(0, weight=1)
@@ -426,8 +550,16 @@ class AuditApp:
                        width=76 if i < 3 else 145, height=36, corner_radius=10)
             b.grid(row=0, column=i, padx=(0, 8))
             self.filter_buttons[mode] = b
+        mode_row = ctk.CTkFrame(self.filters, fg_color='transparent')
+        mode_row.grid(row=0, column=1, sticky='e', padx=(12, 0))
+        label(mode_row, '修复方式', 12, C['muted']).pack(side='left', padx=(0, 8))
+        self.window.option_add('*TCombobox*Listbox.font', (FONT, -round(14 * page._get_widget_scaling())))
+        self.repair_mode_combo = ttk.Combobox(mode_row, textvariable=self.repair_mode, state='readonly',
+                                             values=['另存修复版', '直接修复原文件'], width=17,
+                                             font=(FONT, -round(14 * page._get_widget_scaling())), style='MD3.TCombobox')
+        self.repair_mode_combo.pack(side='left')
         search_row = ctk.CTkFrame(self.filters, fg_color='transparent')
-        search_row.grid(row=1, column=0, sticky='ew', pady=(12, 0))
+        search_row.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(12, 0))
         search_row.grid_columnconfigure(1, weight=1)
         label(search_row, '搜索文件', 12, C['muted']).grid(row=0, column=0, padx=(0, 12))
         self.query = tk.StringVar()
@@ -445,6 +577,13 @@ class AuditApp:
         style = ttk.Style(self.window)
         style.theme_use('clam')
         scale = page._get_widget_scaling()
+        style.configure('MD3.TCombobox', padding=(round(8 * scale), round(10 * scale)),
+                        fieldbackground=C['low'], background=C['low'], foreground=C['text'],
+                        arrowcolor=C['primary'], bordercolor=C['outline'])
+        style.map('MD3.TCombobox', fieldbackground=[('readonly', C['low'])],
+                  foreground=[('disabled', C['muted']), ('readonly', C['text'])],
+                  selectbackground=[('readonly', C['low'])], selectforeground=[('readonly', C['text'])],
+                  bordercolor=[('focus', C['primary'])])
         style.configure('MD3.Treeview', background=C['card'], fieldbackground=C['card'], foreground=C['text'],
                         rowheight=round(44 * scale), borderwidth=0, font=(FONT, -round(14 * scale)), relief='flat')
         style.configure('MD3.Treeview.Heading', background=C['low'], foreground=C['muted'],
@@ -452,9 +591,9 @@ class AuditApp:
         style.map('MD3.Treeview', background=[('selected', C['primary_container'])],
                   foreground=[('selected', C['on_primary_container'])])
         style.map('MD3.Treeview.Heading', background=[('active', C['container'])])
-        self.tree = ttk.Treeview(self.list_card, columns=('name', 'state', 'duplicates'),
-                                 show='headings', selectmode='browse', style='MD3.Treeview', height=4)
-        for key, title, width in [('name', '文件名称', 320), ('state', '检查结果', 200), ('duplicates', '重复记录', 90)]:
+        self.tree = ttk.Treeview(self.list_card, columns=('name', 'state', 'repair'),
+                                 show='headings', selectmode='extended', style='MD3.Treeview', height=4)
+        for key, title, width in [('name', '文件名称', 320), ('state', '原文件检查结果', 190), ('repair', '修复状态', 140)]:
             self.tree.heading(key, text=title, anchor='w')
             self.tree.column(key, width=round(width * scale), minwidth=round(80 * scale), stretch=key == 'name', anchor='w')
         self.tree.grid(row=0, column=0, sticky='nsew', padx=(12, 0), pady=12)
@@ -499,8 +638,18 @@ class AuditApp:
         self.copy_button.pack()
         footer = ctk.CTkFrame(page, fg_color='transparent')
         footer.grid(row=4, column=0, sticky='ew', pady=(16, 0))
-        self.report_folder_button = Button(footer, '报告文件夹', self.open_report_folder, 'text', 'folder', state='disabled')
+        self.report_folder_button = Button(footer, '报告文件夹', self.open_report_folder, 'text', 'folder', width=110, state='disabled')
         self.report_folder_button.pack(side='left')
+        self.repair_selected_button = Button(footer, '修复选中', lambda: self.begin_repair(True),
+                                              'tonal', 'repair', width=132, state='disabled')
+        self.repair_selected_button.pack(side='left', padx=(8, 0))
+        self.repair_action_host = ctk.CTkFrame(footer, fg_color='transparent')
+        self.repair_action_host.pack(side='left', padx=8)
+        self.repair_all_button = Button(self.repair_action_host, '修复全部问题', lambda: self.begin_repair(False),
+                                         'tonal', width=142, state='disabled')
+        self.repair_all_button.grid(row=0, column=0)
+        self.repair_stop_button = Button(self.repair_action_host, '停止修复', self.stop_repair,
+                                          'outlined', 'stop', width=142)
         self.open_button = Button(footer, '打开完整报告', self.open_report, 'filled', 'launch', width=172, state='disabled')
         self.open_button.pack(side='right')
         self.refresh_results()
@@ -513,11 +662,12 @@ class AuditApp:
         viewport.grid(row=0, column=0, sticky='nsew')
         scroll.grid_columnconfigure(0, weight=1)
         sections = [
-            ('01', '选择范围，然后开始检查', '默认选择本地固定磁盘。只检查特定资料时，点击“清空”，再添加文件夹。扫描包含子文件夹，窗口缩放不会改变已选范围。'),
-            ('02', '从检查结果找到需要处理的文件', '按“编号问题”筛选重复、缺失或非法编号；选择文件可查看详细原因、复制路径或打开所在文件夹。完整报告包含 HTML、CSV、Markdown 和逐文件记录。'),
+            ('01', '选择范围，然后开始检查', '默认推荐扫描，跳过已识别的程序、游戏库与缓存；全面扫描保留基础排除。手动指定自动排除的目录仍可检查。“不扫描文件夹”在两种模式下都生效，模式和排除列表自动保存。只检查特定资料时，点击“清空”，再添加文件夹。'),
+            ('02', '选择修复方式', '默认“另存修复版”，也可选“直接修复原文件”。原位模式先备份，再复查并写回，保持原文件名和路径。选中问题文件后点击“修复选中”，或点击“修复全部问题”；Ctrl 或 Shift 可多选。'),
             ('03', '随时停止，已检查的结果会保存', '点击“停止并保存”会生成部分报告。扫描中关闭窗口会先保存再退出。报告保存在程序旁的“报告”文件夹，每次检查使用独立目录。'),
-            ('04', '检查范围与支持格式', '支持 PPTX、PPTM、PPSX、PPSM、POTX、POTM；旧 PPT、PPS、POT 列为未检查。程序只读取源文件，不上传，不修改，也不启动 Office。'),
-            ('05', '如何理解检查结论', '本工具检查传统批注作者编号。“未发现问题”指未发现本次编号问题，不代表文件一定能在 PowerPoint 中打开。保存软件标记用于排查线索，不作为问题来源的证明。系统目录、回收站、开发依赖、链接和云端占位项目会跳过；具体原因写入报告。'),
+            ('04', '备份与支持格式', '原位修复的备份保存在记录目录内的“PPT编号修复备份”，该目录会被扫描跳过。点击“修复文件夹”可查看备份和记录。支持 PPTX、PPTM、PPSX、PPSM、POTX、POTM；旧格式单独列为未检查。'),
+            ('05', '如何理解修复结果', '自动修复重复、缺失、非法或超范围的传统批注作者编号。可明确对应的批注引用同步更新；作者归属不明时标为“需人工确认”。原位修复成功后列表更新为复查结果，扫描时的报告保持原记录。'),
+            ('06', '检查结论的范围', '本工具处理传统批注作者编号；编号检查通过不代表文件没有其他打开问题。保存软件标记用于排查线索，不作为问题来源的证明。系统目录、回收站、开发依赖、链接和云端占位项目会跳过，具体原因写入报告。'),
         ]
         for i, (number, title, body) in enumerate(sections):
             card = ctk.CTkFrame(scroll, fg_color=C['card'], corner_radius=20)
@@ -530,7 +680,7 @@ class AuditApp:
             body_label.grid(row=1, column=1, sticky='ew', padx=(0, 24), pady=(0, 20))
             tk.Frame.bind(card, '<Configure>', lambda e, l=body_label: wrap_label(l,
                 e.width / l._get_widget_scaling() - 104), add='+')
-        label(scroll, '快捷键  Ctrl + Enter 开始检查    Ctrl + F 搜索结果    F1 使用说明', 12, C['muted']).grid(row=6, column=0, sticky='w', padx=8, pady=12)
+        label(scroll, '快捷键  Ctrl + Enter 开始检查    Ctrl + F 搜索结果    F1 使用说明', 12, C['muted']).grid(row=7, column=0, sticky='w', padx=8, pady=12)
 
     def show_page(self, key):
         titles = dict(scan=('PPT 文件检查', '定位批注编号问题，让排查更清晰。'),
@@ -566,7 +716,7 @@ class AuditApp:
                              border_width=0 if selected else 1)
             button.normal_border = 0 if selected else 1
         selected = self.tree.selection()
-        previous = selected[0] if selected else None
+        previous = selected
         self.tree.delete(*self.tree.get_children())
         query = self.query.get().casefold().strip()
         statuses = {'编号问题': {'duplicate', 'invalid'}, '未发现问题': {'clear'},
@@ -575,12 +725,17 @@ class AuditApp:
             if (statuses and item['status'] not in statuses) or query not in item['path'].casefold():
                 continue
             tag = 'problem' if item['status'] in {'duplicate', 'invalid'} else 'unchecked' if item['status'] != 'clear' else 'clear'
+            repaired = self.repair_info.get(item['path'])
+            fixed_text = '已原位修复' if repaired and repaired.get('mode') == 'in_place' else '已另存修复版'
+            repair_text = {'fixed': fixed_text, 'unchanged': '无需修复', 'needs_review': '需人工确认',
+                           'failed': '修复失败'}.get(repaired['status']) if repaired else '待修复' if tag == 'problem' else '—'
             self.tree.insert('', 'end', iid=str(index), values=(Path(item['path']).name,
-                             self.engine.LABELS[item['status']], item['duplicate_records']), tags=(tag,))
+                             self.engine.LABELS[item['status']], repair_text), tags=(tag,))
         count = len(self.tree.get_children())
         self.result_count.configure(text=f'{count:,} 个文件')
-        if previous and self.tree.exists(previous):
-            self.tree.selection_set(previous)
+        retained = [item for item in previous if self.tree.exists(item)]
+        if retained:
+            self.tree.selection_set(*retained)
         else:
             self.detail_title.configure(text='文件详情')
             self.set_detail('选择一个文件，查看完整路径和检查说明。')
@@ -594,6 +749,7 @@ class AuditApp:
             self.empty_title.configure(text=title)
             self.empty_note.configure(text=note)
             self.empty.place(relx=.5, rely=.55, anchor='center')
+        self.update_repair_actions()
 
     def set_detail(self, text):
         self.detail_text.configure(state='normal')
@@ -609,10 +765,103 @@ class AuditApp:
         item = self.selected_result()
         if item:
             self.detail_title.configure(text='文件详情 · ' + self.engine.LABELS[item['status']])
+            repair = self.repair_info.get(item['path'])
             self.set_detail(item['path'] + '\n' + (item['note'] or '未发现传统批注作者编号问题。') +
-                            (f'\n保存软件：{item["application"]}' if item['application'] else ''))
+                            (f'\n保存软件：{item["application"]}' if item['application'] else '') +
+                            (f'\n{repair["note"]}\n修复后文件：{repair["output"]}' if repair else '') +
+                            (f'\n原文件备份：{repair["backup"]}' if repair and repair.get('backup') else ''))
             self.location_button.configure(state='normal')
             self.copy_button.configure(state='normal', text='复制路径')
+        self.update_repair_actions()
+
+    def repair_paths(self, selected_only):
+        items = [self.results[int(i)] for i in self.tree.selection()] if selected_only else self.results
+        return [item['path'] for item in items if item['status'] in {'duplicate', 'invalid'}]
+
+    def update_repair_actions(self):
+        busy = self.state['running'] or self.state['repairing']
+        self.repair_mode_combo.configure(state='disabled' if busy else 'readonly')
+        self.repair_selected_button.configure(state='normal' if not busy and self.repair_paths(True) else 'disabled')
+        self.repair_all_button.configure(state='normal' if not busy and self.repair_paths(False) else 'disabled')
+
+    def open_repair_folder(self):
+        if self.repair_directory:
+            self.open_path(self.repair_directory)
+
+    def begin_repair(self, selected_only):
+        if self.state['running'] or self.state['repairing']:
+            return
+        paths = self.repair_paths(selected_only)
+        if not paths:
+            return
+        in_place = self.repair_mode.get() == '直接修复原文件'
+        title = f'选择 {len(paths)} 个文件的备份和记录位置（修复将写回原文件）' if in_place else f'选择 {len(paths)} 个文件的修复输出位置（保留原文件）'
+        parent = filedialog.askdirectory(parent=self.window, title=title,
+                                         initialdir=str(self.base_dir))
+        if not parent:
+            return
+        self.active_repair_in_place = in_place
+        prefix = 'PPT原位修复_' if in_place else 'PPT编号修复_'
+        self.repair_directory = Path(parent) / (prefix + datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        self.state.update(repairing=True, close_requested=False)
+        self.repair_cancelled.clear()
+        self.update_repair_actions()
+        self.start_button.configure(state='disabled')
+        self.repair_folder_button.configure(state='disabled')
+        self.repair_all_button.grid_remove()
+        self.repair_stop_button.configure(state='normal')
+        self.repair_stop_button.grid(row=0, column=0)
+        action = '备份并原位修复' if in_place else '另存修复版'
+        self.result_summary.configure(text=f'正在{action} · 0 / {len(paths)}')
+        threading.Thread(target=self.repair_work, args=(paths, self.repair_directory, in_place), daemon=True).start()
+
+    def repair_work(self, paths, output, in_place=False):
+        try:
+            from ppt_repair import repair_batch
+            result = repair_batch(paths, output, self.repair_cancelled,
+                                   lambda **data: self.messages.put(('repair_progress', data)), in_place=in_place)
+            self.messages.put(('repair_done', result))
+        except Exception as exc:
+            self.messages.put(('repair_error', str(exc)))
+
+    def stop_repair(self):
+        self.repair_cancelled.set()
+        self.repair_stop_button.configure(state='disabled')
+        self.result_summary.configure(text='正在完成当前文件，随后保存修复记录。')
+
+    def handle_repair_message(self, kind, data):
+        if kind == 'repair_progress':
+            self.repair_info[data['record']['source']] = data['record']
+            record = data['record']
+            if record.get('mode') == 'in_place' and record.get('after'):
+                self.results = [record['after'] if item['path'] == record['source'] else item for item in self.results]
+                if self.summary:
+                    self.summary['counts'] = {key: sum(item['status'] == key for item in self.results) for key in self.engine.LABELS}
+                    self.update_counts(self.summary)
+                self.open_button.configure(text='扫描时报告')
+            self.refresh_results()
+            if not self.repair_cancelled.is_set():
+                action = '已写回' if self.active_repair_in_place else '已另存'
+                self.result_summary.configure(text=f'修复 {data["done"]} / {data["total"]} · {action} {data["counts"]["fixed"]} 个')
+            self.select_result()
+            return False
+        self.state['repairing'] = False
+        self.start_button.configure(state='normal')
+        self.repair_stop_button.grid_remove()
+        self.repair_all_button.grid(row=0, column=0)
+        self.repair_folder_button.configure(state='normal' if self.repair_directory.exists() else 'disabled')
+        self.update_repair_actions()
+        if kind == 'repair_done':
+            counts = data['counts']
+            self.result_summary.configure(text=f'{data["state"]} · 修复 {counts["fixed"]} · 需确认 {counts["needs_review"]} · 失败 {counts["failed"]}')
+            if self.state['close_requested']:
+                self.window.destroy()
+                return True
+        else:
+            self.state['close_requested'] = False
+            self.result_summary.configure(text='修复中断 · 已完成文件与备份保留')
+            messagebox.showerror('修复中断', data, parent=self.window)
+        return False
 
     def copy_path(self):
         item = self.selected_result()
@@ -641,8 +890,8 @@ class AuditApp:
             self.open_path(self.state['report'])
 
     def choose_report(self):
-        if self.state['running']:
-            messagebox.showinfo('检查进行中', '请等待当前检查完成或停止并保存后，再选择报告。', parent=self.window)
+        if self.state['running'] or self.state['repairing']:
+            messagebox.showinfo('任务进行中', '请等待当前检查或修复完成后，再选择报告。', parent=self.window)
             return
         folder = filedialog.askdirectory(parent=self.window, title='选择已保存的报告文件夹',
                                          initialdir=str(self.base_dir / '报告'))
@@ -656,6 +905,9 @@ class AuditApp:
         summary = summary or json.loads((report / '扫描摘要.json').read_text(encoding='utf-8'))
         results = [json.loads(line) for line in (report / '逐文件详情.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
         self.results, self.summary = results, summary
+        self.repair_info, self.repair_directory = {}, None
+        self.repair_folder_button.configure(state='disabled')
+        self.open_button.configure(text='打开完整报告')
         self.state['report'] = report
         self.query.set('')
         self.filter_mode = '全部'
@@ -675,13 +927,14 @@ class AuditApp:
 
     def set_running(self, running):
         self.state['running'] = running
-        for control in self.scope_controls + self.folder_remove_buttons:
+        for control in self.scope_controls + self.folder_remove_buttons + self.exclusion_remove_buttons:
             control.configure(state='disabled' if running else 'normal')
         self.start_button.configure(state='disabled' if running else 'normal')
         self.stop_button.configure(state='normal' if running else 'disabled')
+        self.update_repair_actions()
 
     def start(self):
-        if self.state['running']:
+        if self.state['running'] or self.state['repairing']:
             return
         roots = [path for path, value in self.options if value.get()] + self.folders
         if not roots:
@@ -698,6 +951,9 @@ class AuditApp:
         self.state.update(report=report, close_requested=False)
         self.cancelled.clear()
         self.results, self.summary = [], None
+        self.repair_info, self.repair_directory = {}, None
+        self.repair_folder_button.configure(state='disabled')
+        self.open_button.configure(text='打开完整报告')
         self.query.set('')
         self.refresh_results()
         self.result_summary.configure(text='正在检查，完成后可查看本次结果。')
@@ -711,12 +967,13 @@ class AuditApp:
         self.bar.configure(mode='indeterminate')
         self.bar.start()
         self.show_page('scan')
-        threading.Thread(target=self.work, args=(roots, report), daemon=True).start()
+        options = dict(mode=self.scan_mode, exclude_dirs=list(self.exclude_dirs), explicit_roots=list(self.folders))
+        threading.Thread(target=self.work, args=(roots, report, options), daemon=True).start()
 
-    def work(self, roots, report):
+    def work(self, roots, report, options):
         try:
             summary = self.engine.scan(roots, report, self.cancelled,
-                                       lambda **data: self.messages.put(('progress', data)))
+                                       lambda **data: self.messages.put(('progress', data)), **options)
             self.messages.put(('done', summary))
         except Exception as exc:
             self.messages.put(('error', str(exc)))
@@ -731,6 +988,10 @@ class AuditApp:
     def poll(self):
         while not self.messages.empty():
             kind, data = self.messages.get_nowait()
+            if kind.startswith('repair_'):
+                if self.handle_repair_message(kind, data):
+                    return
+                continue
             if kind == 'progress':
                 self.update_counts(data)
                 if not self.cancelled.is_set():
@@ -769,7 +1030,11 @@ class AuditApp:
         self.poll_id = self.window.after(100, self.poll)
 
     def close(self):
-        if self.state['running']:
+        if self.state['repairing']:
+            self.state['close_requested'] = True
+            self.stop_repair()
+            self.result_summary.configure(text='正在完成当前文件，保存修复记录后关闭。')
+        elif self.state['running']:
             self.state['close_requested'] = True
             self.stop()
             self.status.set('正在保存部分报告，保存成功后自动关闭。')

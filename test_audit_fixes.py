@@ -126,7 +126,7 @@ class AuditFixTests(unittest.TestCase):
         report = self.folder / 'gui-report'
         sample = self.package()
 
-        def worker(roots, output, cancelled, notify):
+        def worker(roots, output, cancelled, notify, **options):
             try:
                 entered.set()
                 if not cancelled.wait(5):

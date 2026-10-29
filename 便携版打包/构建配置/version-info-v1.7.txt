@@ -1,0 +1,23 @@
+# UTF-8
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(1, 7, 0, 0), prodvers=(1, 7, 0, 0),
+        mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1,
+        subtype=0x0, date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable('080404B0', [
+                StringStruct('CompanyName', 'Andyzz'),
+                StringStruct('FileDescription', 'PPT 批注编号检查与修复工具'),
+                StringStruct('FileVersion', '1.7.0.0'),
+                StringStruct('InternalName', 'ppt_audit'),
+                StringStruct('LegalCopyright', 'Copyright © 2026 Andyzz'),
+                StringStruct('OriginalFilename', 'PPT批注编号检查工具_v1.7.exe'),
+                StringStruct('ProductName', 'PPT 批注编号检查工具'),
+                StringStruct('ProductVersion', '1.7.0.0'),
+            ]),
+        ]),
+        VarFileInfo([VarStruct('Translation', [2052, 1200])]),
+    ],
+)

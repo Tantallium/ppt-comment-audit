@@ -22,3 +22,4 @@ dist/
 *.pfx
 *.p12
 *.key
+扫描设置.json

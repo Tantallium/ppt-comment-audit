@@ -1,4 +1,4 @@
-"""只读检查 PowerPoint 传统批注作者编号。"""
+"""检查和修复 PowerPoint 传统批注作者编号。"""
 import argparse
 import csv
 import ctypes
@@ -8,19 +8,20 @@ import os
 from pathlib import Path
 import re
 import signal
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
+from scan_paths import MODES, SKIP_NAMES, discover_files
+
 MODERN = {'.pptx', '.pptm', '.ppsx', '.ppsm', '.potx', '.potm'}
 LEGACY = {'.ppt', '.pps', '.pot'}
 P_NS = {'http://schemas.openxmlformats.org/presentationml/2006/main',
         'http://purl.oclc.org/ooxml/presentationml/main'}
 AUTHOR_TYPE = 'application/vnd.openxmlformats-officedocument.presentationml.commentAuthors+xml'
-SKIP_NAMES = {'$recycle.bin', 'system volume information', '.git', 'node_modules',
-              '__pycache__', '.venv'}
 LABELS = {'duplicate': '发现重复编号', 'invalid': '作者编号或记录异常',
           'clear': '未发现本次编号问题', 'uncheckable': '无法检查',
           'unsupported': '旧格式，未检查'}
@@ -141,49 +142,10 @@ def system_paths():
     return paths
 
 
-def discover(roots, record_skip, cancelled, progress):
-    excluded = system_paths()
-    seen = set()
-    for root in roots:
-        stack = [Path(root).absolute()]
-        while stack and not cancelled.is_set():
-            path = stack.pop()
-            key = os.path.normcase(str(path))
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                stat = path.lstat()
-                attributes = getattr(stat, 'st_file_attributes', 0)
-                # 不跟随目录联接/符号链接，不下载仅存云端的文件。
-                if attributes & (0x1000 | 0x40000 | 0x400000):
-                    record_skip(path, '云端占位或离线项目')
-                    continue
-                if path.is_symlink() or attributes & 0x400:
-                    record_skip(path, '链接或重解析点')
-                    continue
-                if path.is_dir():
-                    if path.name.lower() in SKIP_NAMES or key in excluded:
-                        record_skip(path, '排除目录（系统、回收站、开发依赖或工具测试材料）')
-                        continue
-                    progress(directory=str(path))
-                    with os.scandir(path) as entries:
-                        for entry in entries:
-                            if cancelled.is_set():
-                                break
-                            if entry.name.startswith('~$'):
-                                continue
-                            if entry.is_symlink():
-                                record_skip(entry.path, '链接或重解析点')
-                                continue
-                            if entry.is_dir(follow_symlinks=False):
-                                stack.append(Path(entry.path))
-                            elif Path(entry.name).suffix.lower() in MODERN | LEGACY:
-                                stack.append(Path(entry.path))
-                elif path.suffix.lower() in MODERN | LEGACY:
-                    yield path
-            except OSError as exc:
-                record_skip(path, f'无法访问：{exc}')
+def discover(roots, record_skip, cancelled, progress, *, mode='recommended',
+             exclude_dirs=(), explicit_roots=()):
+    return discover_files(roots, record_skip, cancelled, progress, system_paths(),
+                          mode, exclude_dirs, explicit_roots)
 
 
 def write_html(folder, summary, results):
@@ -231,6 +193,12 @@ def write_markdown(folder, summary, results):
               '自动排除 Windows、Program Files、回收站、系统卷信息、开发依赖目录、本工具验证材料、链接及重解析点、离线或云端占位项目。'
               '无权读取的项目跳过；Office 锁定文件不检查。', '',
               '此列表只覆盖本次实际可检查的文件；“未发现本次编号问题”不代表文件不存在其他问题。', '']
+    lines += ['', '## 扫描模式与排除目录', '',
+              f'- 模式：{summary.get("scan_mode_label", "全面扫描")}。',
+              '- 自定义排除在两种模式下均生效；手动指定的位置可覆盖推荐排除。',
+              '- 全部基础排除及无法访问原因见“未检查项目.jsonl”。', '']
+    for item in summary.get('excluded_directories', []):
+        lines.append(f'- {link(item["path"])}：{item["reason"]}')
     (folder / '待修复列表.md').write_text('\n'.join(lines), encoding='utf-8')
 
 
@@ -242,7 +210,10 @@ def csv_text(value):
     return value
 
 
-def scan(roots, output, cancelled=None, notify=None):
+def scan(roots, output, cancelled=None, notify=None, *, mode='recommended',
+         exclude_dirs=(), explicit_roots=()):
+    if mode not in MODES:
+        raise ValueError(f'未知扫描模式：{mode}')
     cancelled = cancelled or threading.Event()
     notify = notify or (lambda **kwargs: None)
     output = Path(output)
@@ -250,7 +221,11 @@ def scan(roots, output, cancelled=None, notify=None):
     started = time.monotonic()
     summary = dict(started_at=datetime.now().astimezone().isoformat(), roots=[str(r) for r in roots],
                    exclusions=sorted(SKIP_NAMES | system_paths()), directories=0, skipped=0,
-                   counts={key: 0 for key in LABELS}, state='扫描中')
+                   counts={key: 0 for key in LABELS}, state='扫描中',
+                   scan_mode=mode, scan_mode_label=MODES[mode],
+                   custom_exclusions=[str(path) for path in exclude_dirs],
+                   explicit_roots=[str(path) for path in explicit_roots],
+                   excluded_directories=[])
     results = []
     last_notify = 0
     with (output / '未检查项目.jsonl').open('w', encoding='utf-8') as skipped_file, \
@@ -261,6 +236,8 @@ def scan(roots, output, cancelled=None, notify=None):
 
         def record_skip(path, reason):
             summary['skipped'] += 1
+            if reason.startswith(('推荐排除：', '自定义排除目录')):
+                summary['excluded_directories'].append(dict(path=str(path), reason=reason))
             skipped_file.write(json.dumps(dict(path=str(path), reason=reason), ensure_ascii=False) + '\n')
             skipped_file.flush()
 
@@ -273,8 +250,20 @@ def scan(roots, output, cancelled=None, notify=None):
                        skipped=summary['skipped'], counts=summary['counts'].copy(), **info)
                 last_notify = time.monotonic()
 
-        for path in discover(roots, record_skip, cancelled, progress):
+        paths = iter(discover(roots, record_skip, cancelled, progress, mode=mode,
+                              exclude_dirs=exclude_dirs, explicit_roots=explicit_roots))
+        discovery_seconds = inspection_seconds = 0
+        while not cancelled.is_set():
+            phase_started = time.monotonic()
+            try:
+                path = next(paths)
+            except StopIteration:
+                discovery_seconds += time.monotonic() - phase_started
+                break
+            discovery_seconds += time.monotonic() - phase_started
+            phase_started = time.monotonic()
             result = inspect_file(path)
+            inspection_seconds += time.monotonic() - phase_started
             results.append(result)
             summary['counts'][result['status']] += 1
             detail_file.write(json.dumps(result, ensure_ascii=False) + '\n')
@@ -288,7 +277,9 @@ def scan(roots, output, cancelled=None, notify=None):
             progress(file=str(path))
     summary.update(state='已停止，报告为部分结果' if cancelled.is_set() else '完成',
                    finished_at=datetime.now().astimezone().isoformat(), checked=len(results),
-                   seconds=round(time.monotonic() - started, 2))
+                   seconds=round(time.monotonic() - started, 2),
+                   discovery_seconds=round(discovery_seconds, 3),
+                   inspection_seconds=round(inspection_seconds, 3))
     (output / '扫描摘要.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     write_markdown(output, summary, results)
     write_html(output, summary, results)
@@ -305,9 +296,28 @@ def launch_gui(window=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('paths', nargs='*', help='一个或多个文件/文件夹/磁盘根路径')
+    parser.add_argument('--repair', action='store_true', help='修复指定文件的批注作者编号，另存修复版')
+    parser.add_argument('--in-place', action='store_true', help='与 --repair 配合，备份后直接修复原文件')
     parser.add_argument('--all-fixed', action='store_true', help='检查全部本地固定磁盘')
-    parser.add_argument('--output', type=Path, help='新的报告目录，不覆盖已有目录')
+    parser.add_argument('--scan-mode', choices=tuple(MODES), default='recommended',
+                        help='recommended 推荐扫描（默认）；full 全面扫描')
+    parser.add_argument('--exclude-dir', action='append', default=[], type=Path,
+                        help='不扫描的文件夹，可重复指定；两种模式均生效')
+    parser.add_argument('--output', type=Path, help='新的报告或修复输出目录，不覆盖已有目录')
     args = parser.parse_args()
+    if args.in_place and not args.repair:
+        parser.error('--in-place 需要与 --repair 一起使用。')
+    if args.repair:
+        if not args.paths or args.all_fixed:
+            parser.error('编号修复请指定一个或多个文件路径。')
+        from ppt_repair import repair_batch
+        cancelled = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: cancelled.set())
+        output = args.output or Path(__file__).resolve().parent / '修复结果' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        summary = repair_batch(args.paths, output, cancelled, in_place=args.in_place)
+        if sys.stdout is not None:
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
     if not args.paths and not args.all_fixed:
         launch_gui()
         return
@@ -326,7 +336,8 @@ def main():
             last_print = time.monotonic()
 
     signal.signal(signal.SIGINT, lambda *_: cancelled.set())
-    summary = scan(roots, output, cancelled, progress)
+    summary = scan(roots, output, cancelled, progress, mode=args.scan_mode,
+                   exclude_dirs=args.exclude_dir, explicit_roots=args.paths)
     print(json.dumps(dict(report=str(output), **summary), ensure_ascii=False, indent=2))
 
 

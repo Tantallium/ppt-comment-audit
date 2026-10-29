@@ -6,6 +6,10 @@ def write_html(folder, summary, results, labels):
     counts = summary['counts']
     issues = counts['duplicate'] + counts['invalid']
     unchecked = counts['uncheckable'] + counts['unsupported']
+    excluded = summary.get('excluded_directories', [])
+    excluded_rows = ''.join(f'<li class="roots">{html.escape(item["path"])} — {html.escape(item["reason"])}</li>'
+                            for item in excluded)
+    mode = html.escape(summary.get('scan_mode_label', '全面扫描'))
     rows = []
     for result in results:
         state = result['status']
@@ -54,10 +58,13 @@ summary{cursor:pointer;font-weight:600;min-height:28px}details p{max-width:1000p
 <div id="empty" class="empty" hidden>没有匹配的文件，请调整筛选条件或搜索词。</div></div>
 <div class="table-footer"><span id="visible-count" role="status" aria-live="polite"></span><span>遍历 {summary['directories']:,} 个目录 · 跳过或无法访问 {summary['skipped']:,} 项</span></div></section>
 <details><summary>检查范围与结果说明</summary><p class="roots">检查范围：{html.escape('、'.join(summary['roots']))}</p>
+<p>扫描模式：{mode}。自定义排除在两种模式下均生效；手动指定的位置可覆盖推荐排除。</p>
 <p>本工具只检查传统批注作者编号，源文件保持不变。“未发现本次编号问题”不代表文件一定能在 PowerPoint 中打开。
 “末尾追加冲突特征”指重复记录连续位于末尾且编号连续递增；保存软件标记用于排查线索，均不作为问题来源的证明。</p>
 <p>具体范围与跳过原因见同目录的“扫描摘要.json”和“未检查项目.jsonl”。CSV 清单可在 Excel 中打开。</p></details>
-<footer>PPT 批注编号检查工具 · v1.4</footer>'''
+<details><summary>推荐与自定义排除目录 · {len(excluded)} 项</summary>
+<ul>{excluded_rows}</ul><p>全部基础排除及无法访问原因见“未检查项目.jsonl”。</p></details>
+<footer>PPT 批注编号检查工具 · v1.7</footer>'''
     document += '''</main><script>
 let mode='all';const rows=[...document.querySelectorAll('tbody tr')];
 function filterRows(){const q=document.getElementById('search').value.trim().toLocaleLowerCase();let visible=0;

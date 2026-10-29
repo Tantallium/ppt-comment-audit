@@ -29,7 +29,7 @@ def verify_layout(module, count, scaling):
     received = []
     called = threading.Event()
 
-    def scan(roots, output, cancelled, notify):
+    def scan(roots, output, cancelled, notify, **options):
         received.extend(roots)
         called.set()
         return dict(state='完成', checked=0, counts={key: 0 for key in module.LABELS})
